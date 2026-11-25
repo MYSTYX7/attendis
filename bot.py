@@ -355,7 +355,7 @@ async def att_report(i: discord.Interaction, days: app_commands.Range[int, 1, 30
     for n, s in sorted(stats.items()):
         counted = s["present"] + s["absent"]
         pct = f"{100 * s['present'] / counted:.0f}%" if counted else "n/a"
-        out.append(f"**{n}** — ✅{s['present']} ❌{s['absent']} 🟡{s['excused']} · attendance {pct}")
+        out.append(f"**{n}** — {s['present']} Present · {s['absent']} Absent · {s['excused']} Excused || {pct} Attendance")
     await i.response.send_message("\n".join(out)[:1990], ephemeral=True)
 
 
