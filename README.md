@@ -37,3 +37,18 @@ per-mod stats + percentages, CSV export, per-server timezone and threshold.
   Anyone with Manage Server can always decide.
 - Approved leave marks the covered slots **excused**, so they don't count toward attendance %.
   A slot already auto-marked present stays present.
+
+## Keep-alive on Sprites (optional)
+Sprites sleep when idle. The bot can hold an open connection to its own public URL so the host sees activity:
+1. `sprite info` -> copy the URL; `sprite config update --url-auth public`
+2. Add `KEEPALIVE_URL=<that url>` to `.env`, then `sprite-env services restart attendis`
+This is a best-effort workaround, not a guarantee; check the bot stays online for a few hours.
+
+## Interactive panel
+`/panel` opens a private panel just for you, built for your role:
+- **Everyone/moderators:** My Slots, My Stats, Apply Leave, My Leaves, Pending Leaves (their own).
+- **Admins (Manage Server)** also get: Add Mod, Remove Mod, Add Time Slot, Remove Time Slot, Roster /
+  Mark, Today, Report / Export CSV, Settings, Refresh. Pending Leaves shows everyone's for admins.
+`/panel public:True` (admins) posts a public **Open Panel** button that stays working after restarts.
+Optional text trigger: set `TEXT_TRIGGER=att` in `.env` and enable **Message Content Intent** in the
+Developer Portal; typing `att` posts the same Open Panel button. Private panels expire after ~14 min; reopen them.

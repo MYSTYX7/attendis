@@ -2,6 +2,7 @@ import os, io, csv, asyncio, datetime as dt
 from zoneinfo import ZoneInfo, available_timezones
 
 import discord
+from aiohttp import web, ClientSession, ClientTimeout
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -13,7 +14,9 @@ sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 intents = discord.Intents.default()
 intents.members = True
 intents.presences = True
+TRIGGER = (os.getenv("TEXT_TRIGGER") or "").strip().lower()   # e.g. "att" -> typing it opens the panel
 intents.voice_states = True
+intents.message_content = bool(TRIGGER)
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
@@ -122,7 +125,7 @@ async def track_guild(guild: discord.Guild):
             continue
         if any(l["user_id"] == s["user_id"] and (not l["slot_ids"] or s["id"] in l["slot_ids"]) for l in leaves):
             row = await get_row(s, today)
-            if row["status"] in ("pending", "absent"):
+            if row["status"] == "pending" or (row["status"] == "absent" and row.get("method") != "manual"):
                 await save_row(row, status="excused", method="leave", note="Approved leave",
                                marked_at=dt.datetime.now(dt.timezone.utc).isoformat())
             continue
@@ -355,7 +358,7 @@ async def att_report(i: discord.Interaction, days: app_commands.Range[int, 1, 30
     for n, s in sorted(stats.items()):
         counted = s["present"] + s["absent"]
         pct = f"{100 * s['present'] / counted:.0f}%" if counted else "n/a"
-        out.append(f"**{n}** — {s['present']} Present · {s['absent']} Absent · {s['excused']} Excused || {pct} Attendance")
+        out.append(f"**{n}** — ✅{s['present']} ❌{s['absent']} 🟡{s['excused']} · attendance {pct}")
     await i.response.send_message("\n".join(out)[:1990], ephemeral=True)
 
 
@@ -479,6 +482,48 @@ async def mystats(i: discord.Interaction):
         out.append("No attendance records yet for your slots.")
     await i.response.send_message("\n".join(out)[:1990], ephemeral=True)
 
+# ---------- optional keep-alive (for hosts that sleep idle VMs, e.g. Fly.io Sprites) ----------
+async def self_hold(base: str):
+    """Hold a long-lived request open to our own public URL so the host sees an active connection."""
+    while True:
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=None, sock_connect=15)) as sess:
+                async with sess.get(base.rstrip("/") + "/hold") as r:
+                    async for _ in r.content.iter_any():
+                        pass
+        except Exception as e:
+            print(f"[keepalive] {e!r}")
+        await asyncio.sleep(5)
+
+
+async def start_keepalive():
+    base = os.getenv("KEEPALIVE_URL")
+    if not base:
+        return
+
+    async def hold(request):
+        resp = web.StreamResponse()
+        await resp.prepare(request)
+        try:
+            while True:
+                await resp.write(b".\n")
+                await asyncio.sleep(20)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        return resp
+
+    app = web.Application()
+    app.add_routes([web.get("/", lambda r: web.Response(text="ok")), web.get("/hold", hold)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
+    asyncio.create_task(self_hold(base))
+    print(f"[keepalive] serving on :{os.getenv('PORT', '8080')}, holding {base}")
+
+
+_keepalive_started = False
+
+
 # ---------- leave requests ----------
 def parse_date(s: str) -> dt.date:
     return dt.date.fromisoformat(s.strip())
@@ -499,7 +544,7 @@ async def apply_leave_to_existing(L: dict):
     req = (sb.table("attendance").update({"status": "excused", "method": "leave", "note": "Approved leave"})
            .eq("guild_id", L["guild_id"]).eq("user_id", L["user_id"])
            .gte("att_date", L["start_date"]).lte("att_date", L["end_date"])
-           .in_("status", ["pending", "absent"]))
+           .in_("status", ["pending", "absent"]).or_("method.is.null,method.neq.manual"))
     if L.get("slot_ids"):
         req = req.in_("slot_id", L["slot_ids"])
     await q(req)
@@ -676,13 +721,348 @@ async def leave_cancel(i: discord.Interaction, leave_id: int):
                                   "No pending request with that id is yours.", ephemeral=True)
 
 
+# ---------- interactive control panel ----------
+async def admin_only(i: discord.Interaction) -> bool:
+    if i.user.guild_permissions.manage_guild:
+        return True
+    await i.response.send_message("🔒 You need the **Manage Server** permission for this button.", ephemeral=True)
+    return False
+
+
+async def panel_embed(guild: discord.Guild) -> discord.Embed:
+    cfg = await get_cfg(guild.id)
+    today = dt.datetime.now(ZoneInfo(cfg["timezone"])).date()
+    slots = await q(sb.table("slots").select("*").eq("guild_id", str(guild.id)))
+    rows = await q(sb.table("attendance").select("status").eq("guild_id", str(guild.id))
+                   .eq("att_date", today.isoformat()))
+    c = {k: sum(r["status"] == k for r in rows) for k in ("present", "pending", "absent", "excused")}
+    e = discord.Embed(title="🛡️ ATTENDIS — ATTENDANCE PANEL", color=0x5865F2)
+    e.description = (f"📅 **{today:%a, %d %b %Y}** · {cfg['timezone']}\n"
+                     f"Slots today: **{sum(applies(s, today) for s in slots)}** · ✅ {c['present']} · "
+                     f"⏳ {c['pending']} · ❌ {c['absent']} · 🟡 {c['excused']}\n"
+                     f"Auto-present after **{cfg['min_minutes']} min** ({cfg['mode']})")
+    e.set_footer(text="Attendis · attendance panel")
+    return e
+
+
+def pick_view(options, placeholder, on_pick) -> discord.ui.View:
+    v = discord.ui.View(timeout=120)
+    sel = discord.ui.Select(placeholder=placeholder, options=options[:25])
+
+    async def cb(i: discord.Interaction):
+        await on_pick(i, sel.values[0])
+    sel.callback = cb
+    v.add_item(sel)
+    return v
+
+
+async def roster_options(gid) -> list[discord.SelectOption]:
+    mods = await q(sb.table("moderators").select("name,user_id").eq("guild_id", str(gid)).order("name"))
+    return [discord.SelectOption(label=m["name"][:100], value=m["user_id"]) for m in mods]
+
+
+async def today_slot_options(guild_id, today) -> tuple[list[discord.SelectOption], dict]:
+    slots = await q(sb.table("slots").select("*, moderators(name)").eq("guild_id", str(guild_id)))
+    slots = sorted([s for s in slots if applies(s, today)], key=lambda s: s["start_time"])
+    return ([discord.SelectOption(label=f"{s['moderators']['name']} · {slot_label(s)}"[:100], value=str(s["id"]))
+             for s in slots[:25]], {str(s["id"]): s for s in slots})
+
+
+class SlotModal(discord.ui.Modal, title="Add slot"):
+    start = discord.ui.TextInput(label="Start (24h HH:MM)", placeholder="09:00", max_length=5)
+    end = discord.ui.TextInput(label="End (24h HH:MM)", placeholder="17:00", max_length=5)
+    day = discord.ui.TextInput(label="Day", default="daily", max_length=10,
+                               placeholder="daily / weekdays / mon..sun / 2026-12-01")
+
+    def __init__(self, member: discord.Member):
+        super().__init__()
+        self.member = member
+
+    async def on_submit(self, i: discord.Interaction):
+        d = self.day.value.strip().lower()
+        names = {"daily": "daily", "weekdays": "weekdays", **{n.lower(): str(k) for k, n in enumerate(DAYS)}}
+        choice = app_commands.Choice(name=d, value=names[d]) if d in names else None
+        await slot_add.callback(i, self.member, self.start.value, self.end.value, choice,
+                                None if choice else d)
+
+
+class StatusView(discord.ui.View):
+    def __init__(self, slot: dict):
+        super().__init__(timeout=120)
+        self.slot = slot
+
+    async def _go(self, i: discord.Interaction, status: str):
+        member = i.guild.get_member(int(self.slot["user_id"]))
+        if not member:
+            return await i.response.send_message("That moderator isn't in the server.", ephemeral=True)
+        await att_mark.callback(i, member, app_commands.Choice(name=status, value=status),
+                                self.slot["id"], None, None, False)
+
+    @discord.ui.button(label="Present", style=discord.ButtonStyle.success, emoji="✅")
+    async def present(self, i, b): await self._go(i, "present")
+
+    @discord.ui.button(label="Absent", style=discord.ButtonStyle.danger, emoji="❌")
+    async def absent(self, i, b): await self._go(i, "absent")
+
+    @discord.ui.button(label="Excused", style=discord.ButtonStyle.secondary, emoji="🟡")
+    async def excused(self, i, b): await self._go(i, "excused")
+
+
+class SettingsModal(discord.ui.Modal, title="Edit settings"):
+    def __init__(self, c: dict):
+        super().__init__()
+        self.mins = discord.ui.TextInput(label="Minutes needed for present", default=str(c["min_minutes"]), max_length=3)
+        self.tz = discord.ui.TextInput(label="Timezone", default=c["timezone"], max_length=40)
+        self.mode = discord.ui.TextInput(label="Mode: presence / voice / either", default=c["mode"], max_length=8)
+        self.rem = discord.ui.TextInput(label="Reminder minutes before slot", default=str(c["reminder_minutes"]), max_length=3)
+        for x in (self.mins, self.tz, self.mode, self.rem):
+            self.add_item(x)
+
+    async def on_submit(self, i: discord.Interaction):
+        m = self.mode.value.strip().lower()
+        if not (self.mins.value.isdigit() and 1 <= int(self.mins.value) <= 600 and self.rem.value.isdigit()
+                and 0 <= int(self.rem.value) <= 120 and m in ("presence", "voice", "either")):
+            return await i.response.send_message("Invalid values (minutes 1-600, reminder 0-120, "
+                                                 "mode presence/voice/either).", ephemeral=True)
+        await cfg_set.callback(i, min_minutes=int(self.mins.value), timezone=self.tz.value.strip(),
+                               mode=app_commands.Choice(name=m, value=m), reminder_minutes=int(self.rem.value))
+
+
+class SettingsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Edit values", emoji="⚙️", style=discord.ButtonStyle.primary, row=0)
+    async def edit(self, i, b): await i.response.send_modal(SettingsModal(await get_cfg(i.guild_id)))
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text],
+                       placeholder="📜 Log channel", row=1)
+    async def log_ch(self, i, sel): await cfg_set.callback(i, log_channel=sel.values[0])
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text],
+                       placeholder="📝 Leave-requests channel", row=2)
+    async def leave_ch(self, i, sel): await cfg_set.callback(i, leave_channel=sel.values[0])
+
+    @discord.ui.select(cls=discord.ui.MentionableSelect, placeholder="✅ Leave approvers (roles/members)",
+                       min_values=0, max_values=10, row=3)
+    async def approvers(self, i, sel):
+        keys = [("role:" if isinstance(v, discord.Role) else "user:") + str(v.id) for v in sel.values]
+        await save_cfg(i.guild_id, {"leave_approvers": keys})
+        await i.response.send_message(f"Approvers: {fmt_approvers(keys)} (+ anyone with Manage Server)",
+                                      ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+class LeaveModal(discord.ui.Modal):
+    def __init__(self, kind: str):
+        super().__init__(title={"whole_day": "Leave: whole day", "date_range": "Leave: date range",
+                                "today_slots": "Leave: today's slots"}[kind])
+        self.kind = kind
+        self.reason = discord.ui.TextInput(label="Reason", style=discord.TextStyle.paragraph, max_length=300)
+        self.frm = discord.ui.TextInput(label="From date YYYY-MM-DD" + ("" if kind == "date_range" else " (blank = today)"),
+                                        required=kind == "date_range", max_length=10)
+        self.to = discord.ui.TextInput(label="To date YYYY-MM-DD", required=True, max_length=10)
+        self.add_item(self.reason)
+        if kind != "today_slots":
+            self.add_item(self.frm)
+        if kind == "date_range":
+            self.add_item(self.to)
+
+    async def on_submit(self, i: discord.Interaction):
+        await leave_apply.callback(i, app_commands.Choice(name=self.kind, value=self.kind), self.reason.value,
+                                   self.frm.value.strip() or None if self.kind != "today_slots" else None,
+                                   self.to.value.strip() or None if self.kind == "date_range" else None)
+
+
+class PanelView(discord.ui.View):
+    """Per-user (ephemeral) panel: moderators get row 1 only, admins get everything."""
+    def __init__(self, admin: bool = False):
+        super().__init__(timeout=840)
+        if not admin:
+            for child in list(self.children):
+                if child.row != 0:
+                    self.remove_item(child)
+
+    # ---- row 0: everyone
+    @discord.ui.button(label="My Slots", emoji="🕒", style=discord.ButtonStyle.primary, custom_id="att:myslots", row=0)
+    async def b_myslots(self, i, b): await myslots.callback(i)
+
+    @discord.ui.button(label="My Stats", emoji="📊", style=discord.ButtonStyle.primary, custom_id="att:mystats", row=0)
+    async def b_mystats(self, i, b): await mystats.callback(i)
+
+    @discord.ui.button(label="Apply Leave", emoji="🏖️", style=discord.ButtonStyle.success, custom_id="att:leave", row=0)
+    async def b_leave(self, i, b):
+        v = pick_view([discord.SelectOption(label="Whole day", value="whole_day"),
+                       discord.SelectOption(label="Date range (2-3 days etc.)", value="date_range"),
+                       discord.SelectOption(label="Specific slots today", value="today_slots")],
+                      "What kind of leave?", lambda i2, val: i2.response.send_modal(LeaveModal(val)))
+        await i.response.send_message("Choose leave type:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="My Leaves", emoji="📄", style=discord.ButtonStyle.secondary, custom_id="att:myleaves", row=0)
+    async def b_myleaves(self, i, b): await leave_list.callback(i)
+
+    # ---- row 1: roster & slots (admin)
+    @discord.ui.button(label="Add Mod", emoji="➕", style=discord.ButtonStyle.success, custom_id="att:addmod", row=1)
+    async def b_addmod(self, i, b):
+        if not await admin_only(i):
+            return
+        v = discord.ui.View(timeout=120)
+        sel = discord.ui.UserSelect(placeholder="Pick moderator(s)", min_values=1, max_values=10)
+
+        async def cb(i2: discord.Interaction):
+            us = [u for u in sel.values if not u.bot]
+            await q(sb.table("moderators").upsert(
+                [{"guild_id": str(i2.guild_id), "user_id": str(u.id), "name": u.display_name} for u in us],
+                on_conflict="guild_id,user_id"))
+            await i2.response.edit_message(content="Added: " + ", ".join(u.display_name for u in us), view=None)
+        sel.callback = cb
+        v.add_item(sel)
+        await i.response.send_message("Who should be added to the roster?", view=v, ephemeral=True)
+
+    @discord.ui.button(label="Remove Mod", emoji="➖", style=discord.ButtonStyle.danger, custom_id="att:rmmod", row=1)
+    async def b_rmmod(self, i, b):
+        if not await admin_only(i):
+            return
+        opts = await roster_options(i.guild_id)
+        if not opts:
+            return await i.response.send_message("Roster is empty.", ephemeral=True)
+
+        async def pick(i2, uid):
+            await q(sb.table("moderators").delete().eq("guild_id", str(i2.guild_id)).eq("user_id", uid))
+            await i2.response.edit_message(content=f"Removed <@{uid}> (their slots & history too).", view=None)
+        await i.response.send_message("Remove which moderator?", view=pick_view(opts, "Choose moderator", pick),
+                                      ephemeral=True)
+
+    @discord.ui.button(label="Add Time Slot", emoji="🗓️", style=discord.ButtonStyle.success, custom_id="att:addslot", row=1)
+    async def b_addslot(self, i, b):
+        if not await admin_only(i):
+            return
+        opts = await roster_options(i.guild_id)
+        if not opts:
+            return await i.response.send_message("Add a moderator first.", ephemeral=True)
+
+        async def pick(i2, uid):
+            m = i2.guild.get_member(int(uid))
+            if not m:
+                return await i2.response.send_message("That moderator isn't in the server.", ephemeral=True)
+            await i2.response.send_modal(SlotModal(m))
+        await i.response.send_message("Add a slot for:", view=pick_view(opts, "Choose moderator", pick), ephemeral=True)
+
+    @discord.ui.button(label="Remove Time Slot", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="att:rmslot", row=1)
+    async def b_rmslot(self, i, b):
+        if not await admin_only(i):
+            return
+        slots = await q(sb.table("slots").select("*, moderators(name)").eq("guild_id", str(i.guild_id)).order("id"))
+        if not slots:
+            return await i.response.send_message("No slots.", ephemeral=True)
+        opts = [discord.SelectOption(label=f"#{s['id']} {s['moderators']['name']} · {slot_label(s)}"[:100],
+                                     value=str(s["id"])) for s in slots[:25]]
+        await i.response.send_message("Remove which slot?", ephemeral=True, view=pick_view(
+            opts, "Choose slot", lambda i2, v: slot_remove.callback(i2, int(v))))
+
+    @discord.ui.button(label="Roster", emoji="👥", style=discord.ButtonStyle.secondary, custom_id="att:roster", row=1)
+    async def b_roster(self, i, b):
+        if await admin_only(i):
+            await mod_list.callback(i)
+
+    # ---- row 2: attendance (admin)
+    @discord.ui.button(label="Mark", emoji="✍️", style=discord.ButtonStyle.primary, custom_id="att:mark", row=2)
+    async def b_mark(self, i, b):
+        if not await admin_only(i):
+            return
+        today = dt.datetime.now(ZoneInfo((await get_cfg(i.guild_id))["timezone"])).date()
+        opts, by_id = await today_slot_options(i.guild_id, today)
+        if not opts:
+            return await i.response.send_message("No slots today.", ephemeral=True)
+
+        async def pick(i2, sid):
+            await i2.response.edit_message(content=f"Mark **{by_id[sid]['moderators']['name']}** · "
+                                                   f"{slot_label(by_id[sid])} as:", view=StatusView(by_id[sid]))
+        await i.response.send_message("Which slot?", ephemeral=True, view=pick_view(opts, "Choose today's slot", pick))
+
+    @discord.ui.button(label="Today", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="att:today", row=2)
+    async def b_today(self, i, b):
+        if await admin_only(i):
+            await att_today.callback(i)
+
+    @discord.ui.button(label="Report", emoji="📈", style=discord.ButtonStyle.secondary, custom_id="att:report", row=2)
+    async def b_report(self, i, b):
+        if await admin_only(i):
+            await att_report.callback(i)
+
+    @discord.ui.button(label="Export CSV", emoji="📤", style=discord.ButtonStyle.secondary, custom_id="att:export", row=3)
+    async def b_export(self, i, b):
+        if await admin_only(i):
+            await att_export.callback(i)
+
+    @discord.ui.button(label="Settings", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="att:settings", row=3)
+    async def b_settings(self, i, b):
+        if not await admin_only(i):
+            return
+        c = await get_cfg(i.guild_id)
+        await i.response.send_message(
+            f"**Settings** — min **{c['min_minutes']}** min · {c['timezone']} · mode **{c['mode']}** · "
+            f"reminder **{c['reminder_minutes']}** min\nApprovers: {fmt_approvers(c.get('leave_approvers'))}",
+            view=SettingsView(), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    # ---- row 3: leave inbox (admin)
+    @discord.ui.button(label="Pending Leaves", emoji="📥", style=discord.ButtonStyle.secondary, custom_id="att:pending", row=0)
+    async def b_pending(self, i, b):
+        admin = i.user.guild_permissions.manage_guild
+        req = (sb.table("leaves").select("*, moderators(name)").eq("guild_id", str(i.guild_id))
+               .eq("status", "pending"))
+        if not admin:
+            req = req.eq("user_id", str(i.user.id))
+        rows = await q(req.order("id"))
+        txt = "\n".join(f"`#{r['id']}` **{r['moderators']['name']}** — {r['start_date']}"
+                        f"{'' if r['start_date'] == r['end_date'] else ' → ' + r['end_date']}"
+                        f"{' (slots)' if r['slot_ids'] else ''} — {r['reason'] or ''}" for r in rows)
+        note = "\n_Approve/Reject using the buttons on each request in the leave channel._" if rows and admin else ""
+        await i.response.send_message((txt or "No pending leave requests. 🎉") + note, ephemeral=True)
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="att:refresh", row=3)
+    async def b_refresh(self, i, b): await i.response.edit_message(embed=await panel_embed(i.guild))
+
+
+class LauncherView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Panel", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="att:open")
+    async def open_panel(self, i, b):
+        await i.response.send_message(embed=await panel_embed(i.guild), ephemeral=True,
+                                      view=PanelView(i.user.guild_permissions.manage_guild))
+
+
+@tree.command(name="panel", description="Open your Attendis panel")
+@app_commands.describe(public="Post a public 'Open Panel' button for everyone (admins only)")
+@app_commands.guild_only()
+async def panel(i: discord.Interaction, public: bool = False):
+    if public:
+        if not i.user.guild_permissions.manage_guild:
+            return await i.response.send_message("Only admins can post the public panel.", ephemeral=True)
+        return await i.response.send_message(embed=await panel_embed(i.guild), view=LauncherView())
+    await i.response.send_message(embed=await panel_embed(i.guild), ephemeral=True,
+                                  view=PanelView(i.user.guild_permissions.manage_guild))
+
+
+@bot.event
+async def on_message(m: discord.Message):
+    if TRIGGER and m.guild and not m.author.bot and m.content.strip().lower() == TRIGGER:
+        await m.channel.send(embed=await panel_embed(m.guild), view=LauncherView())
+
+
 for g in (mod_g, slot_g, att_g, cfg_g, leave_g):
     tree.add_command(g)
 
 
 @bot.event
 async def on_ready():
+    global _keepalive_started
+    if not _keepalive_started:
+        _keepalive_started = True
+        await start_keepalive()
     bot.add_dynamic_items(LeaveBtn)
+    bot.add_view(LauncherView())
     await tree.sync()
     if not tracker.is_running():
         tracker.start()
